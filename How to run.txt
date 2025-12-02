@@ -1,0 +1,9 @@
+1. Go to: 
+cd D:\M. Tech\Major Project\Crop Recommendation using XAI\Project
+
+2. Activate venv scripts: 
+.\venv\Scripts\activate
+
+3. Run app.py file: 
+streamlit run app.py
+
