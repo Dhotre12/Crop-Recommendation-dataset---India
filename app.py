@@ -1,15 +1,11 @@
 import streamlit as st
-import pandas as pd
-import numpy as np
 import torch
 import torch.nn as nn
-import os
-import joblib
-import sklearn  # Added to ensure context for unpickling
+import numpy as np
+import pandas as pd
+import torch.nn.functional as F
 
-# ==============================================================================
-# 1. MODEL ARCHITECTURES (Must match the Notebook exactly)
-# ==============================================================================
+# --- 1. Model Definitions (Must match the training notebook exactly) ---
 
 class ImprovedCropCNN(nn.Module):
     def __init__(self, input_size, num_classes):
@@ -175,201 +171,169 @@ class HybridCNNLSTM(nn.Module):
         x = self.dropout(x)
         return self.fc3(x)
 
-# ==============================================================================
-# 2. UTILITY FUNCTIONS
-# ==============================================================================
-
+# --- 2. Helper Functions ---
 @st.cache_resource
-def load_system_data(filename='india_crop_system.pth'):
-    if not os.path.exists(filename):
+def load_system():
+    try:
+        # FIX: We set weights_only=False because the file contains Scikit-learn objects (Scaler, Encoder)
+        # which are not allowed by default in PyTorch 2.6+
+        checkpoint = torch.load('india_crop_system.pth', map_location=torch.device('cpu'), weights_only=False)
+        return checkpoint
+    except FileNotFoundError:
         return None
-    
-    # Load checkpoint
-    # FIXED: Added weights_only=False to allow loading sklearn objects in PyTorch 2.6+
-    checkpoint = torch.load(filename, map_location=torch.device('cpu'), weights_only=False)
-    
-    # Extract Metadata
-    metadata = checkpoint['metadata']
-    input_size = metadata['input_size']
-    num_classes = metadata['num_classes']
-    
-    # Reconstruct Models
-    models = {}
-    state_dicts = checkpoint['models_state_dict']
-    
-    # Init blank models
-    model_configs = {
-        'CNN': ImprovedCropCNN(input_size, num_classes),
-        'LSTM': ImprovedCropLSTM(input_size, 128, 2, num_classes),
-        'GRU': ImprovedCropGRU(input_size, 128, 2, num_classes),
-        'Transformer': CropTransformer(input_size, 128, 4, 3, num_classes),
-        'ResidualMLP': ResidualMLP(input_size, 256, num_classes),
-        'Hybrid': HybridCNNLSTM(input_size, num_classes)
-    }
-    
-    # Load weights
-    for name, model in model_configs.items():
-        if name in state_dicts:
-            model.load_state_dict(state_dicts[name])
-            model.eval()
-            models[name] = model
-            
-    return {
-        'models': models,
-        'accuracies': checkpoint['accuracies'],
-        'best_name': checkpoint['best_model_name'],
-        'scaler': metadata['scaler'],
-        'encoder': metadata['label_encoder'],
-        'feature_names': metadata['feature_names'],
-        'class_names': metadata['class_names']
-    }
+    except Exception as e:
+        st.error(f"Failed to load checkpoint: {e}")
+        return None
 
-def predict_crop(system_data, inputs):
-    """
-    Predicts using the BEST model.
-    """
-    # 1. Preprocess
-    scaler = system_data['scaler']
-    le = system_data['encoder']
-    best_model_name = system_data['best_name']
-    best_model = system_data['models'][best_model_name]
-    
-    input_array = np.array(inputs).reshape(1, -1)
-    scaled_input = scaler.transform(input_array)
-    tensor_input = torch.FloatTensor(scaled_input)
-    
-    # 2. Predict
-    with torch.no_grad():
-        outputs = best_model(tensor_input)
-        probs = torch.softmax(outputs, dim=1)
-        top_prob, top_idx = torch.max(probs, 1)
-        
-        # Get top 3 for detail
-        top3_probs, top3_idxs = torch.topk(probs, 3)
-    
-    # 3. Format Results
-    top_pred = le.inverse_transform([top_idx.item()])[0]
-    
-    top3_results = []
-    for i in range(3):
-        idx = top3_idxs[0][i].item()
-        p = top3_probs[0][i].item()
-        name = le.inverse_transform([idx])[0]
-        top3_results.append((name, p))
-        
-    return top_pred, top_prob.item(), top3_results
+# --- 3. UI Layout ---
+st.set_page_config(page_title="Indian Crop Recommendation", layout="wide")
 
-def get_all_model_predictions(system_data, inputs):
-    """
-    Gets predictions from ALL models for comparison.
-    """
-    scaler = system_data['scaler']
-    le = system_data['encoder']
-    
-    input_array = np.array(inputs).reshape(1, -1)
-    scaled_input = scaler.transform(input_array)
-    tensor_input = torch.FloatTensor(scaled_input)
-    
-    results = []
-    
-    for name, model in system_data['models'].items():
-        with torch.no_grad():
-            out = model(tensor_input)
-            prob, idx = torch.max(torch.softmax(out, dim=1), 1)
-            pred_class = le.inverse_transform([idx.item()])[0]
-            
-            # Get test accuracy for this model
-            test_acc = system_data['accuracies'].get(name, 0.0)
-            
-            results.append({
-                'Algorithm': name,
-                'Prediction': pred_class.title(),
-                'Confidence': f"{prob.item():.2%}",
-                'Test Accuracy': test_acc
-            })
-            
-    return pd.DataFrame(results)
+st.title("🌱 Indian Crop Recommendation System")
+st.markdown("Analyze soil and weather conditions using multiple Deep Learning models to predict the best crop.")
 
-# ==============================================================================
-# 3. STREAMLIT UI
-# ==============================================================================
-
-st.set_page_config(page_title="India Crop Recommender", page_icon="🌾", layout="wide")
-
-st.title("🌾 Intelligent Crop Recommendation System (India)")
-st.markdown("Using Advanced Deep Learning Architectures (CNN, LSTM, Transformer, etc.)")
-
-# Load System
-system_path = 'india_crop_system.pth'
-system_data = load_system_data(system_path)
+# Load Data
+system_data = load_system()
 
 if system_data is None:
-    st.error(f"❌ Model file '{system_path}' not found!")
-    st.info("⚠️ Please run the 'System Export Script' in your notebook to generate this file.")
+    st.error("⚠️ `india_crop_system.pth` not found. Please run the training notebook first to generate the system file.")
     st.stop()
 
+# Extract components
+metadata = system_data['metadata']
+scaler = metadata['scaler']
+label_encoder = metadata['label_encoder']
+saved_models = system_data['models_state_dict']
+test_accuracies = system_data['accuracies']
+best_model_name = system_data['best_model_name']
+
+input_size = metadata['input_size']   # Should be 7
+num_classes = metadata['num_classes'] # Should be 22
+
 # --- Sidebar Inputs ---
-st.sidebar.header("📝 Soil & Climate Data")
+st.sidebar.header("🌍 Soil & Weather Conditions")
 
-def user_input_features():
-    # Ranges based on typical India dataset values
-    N = st.sidebar.slider('Nitrogen (N)', 0, 140, 90)
-    P = st.sidebar.slider('Phosphorous (P)', 5, 145, 42)
-    K = st.sidebar.slider('Potassium (K)', 5, 205, 43)
-    temp = st.sidebar.slider('Temperature (°C)', 8.0, 45.0, 20.8)
-    humidity = st.sidebar.slider('Humidity (%)', 10.0, 100.0, 82.0)
-    ph = st.sidebar.slider('pH Level', 3.5, 10.0, 6.5)
-    rainfall = st.sidebar.slider('Rainfall (mm)', 20.0, 300.0, 202.9)
+# Inputs matching the dataset features: N, P, K, temperature, humidity, ph, rainfall
+N = st.sidebar.slider("Nitrogen (N)", 0, 140, 40)
+P = st.sidebar.slider("Phosphorus (P)", 5, 145, 50)
+K = st.sidebar.slider("Potassium (K)", 5, 205, 50)
+temperature = st.sidebar.slider("Temperature (°C)", 8.0, 45.0, 25.0)
+humidity = st.sidebar.slider("Humidity (%)", 14.0, 100.0, 70.0)
+ph = st.sidebar.slider("pH Level", 3.5, 10.0, 6.5)
+rainfall = st.sidebar.slider("Rainfall (mm)", 20.0, 300.0, 100.0)
+
+# --- Main Inference Block ---
+if st.button("🚀 Analyze & Predict", use_container_width=True):
     
-    data = [N, P, K, temp, humidity, ph, rainfall]
-    return data
-
-input_data = user_input_features()
-
-# --- Main Page ---
-
-col1, col2 = st.columns([1, 1.5])
-
-with col1:
-    st.subheader("Current Input")
-    input_df = pd.DataFrame([input_data], columns=['N', 'P', 'K', 'Temp', 'Humid', 'pH', 'Rain'])
-    st.dataframe(input_df, hide_index=True)
-    
-    if st.button("🔍 Recommend Crop", type="primary", use_container_width=True):
-        with st.spinner('Analyzing soil patterns...'):
-            best_crop, confidence, top3 = predict_crop(system_data, input_data)
+    # 1. Prepare Input
+    try:
+        # Feature vector: [N, P, K, temperature, humidity, ph, rainfall]
+        features = np.array([[N, P, K, temperature, humidity, ph, rainfall]])
+        features_scaled = scaler.transform(features)
+        input_tensor = torch.FloatTensor(features_scaled)
+        
+        # 2. Run All Models
+        # Dictionary mapping name to Class Instance with specific hyperparameters from notebook
+        model_instances = {
+            'CNN': ImprovedCropCNN(input_size, num_classes),
+            'LSTM': ImprovedCropLSTM(input_size, 128, 2, num_classes),
+            'GRU': ImprovedCropGRU(input_size, 128, 2, num_classes),
+            'Transformer': CropTransformer(input_size, 128, 4, 3, num_classes),
+            'ResidualMLP': ResidualMLP(input_size, 256, num_classes),
+            'Hybrid': HybridCNNLSTM(input_size, num_classes)
+        }
+        
+        results = []
+        best_confidence = -1
+        best_probs = None
+        
+        progress_bar = st.progress(0)
+        model_names = list(model_instances.keys())
+        
+        for idx, name in enumerate(model_names):
+            model = model_instances[name]
             
-            # Display Primary Result
-            st.success(f"### 🏆 Recommended: **{best_crop.title()}**")
-            st.metric(label="Confidence Score", value=f"{confidence:.2%}")
-            
-            st.markdown("---")
-            st.caption(f"Based on **{system_data['best_name']}** model (Highest Accuracy)")
-            
-            # Top 3 probabilities chart
-            st.subheader("Alternative Options")
-            probs_df = pd.DataFrame(top3, columns=['Crop', 'Probability'])
-            probs_df['Probability'] = probs_df['Probability'] * 100
-            st.bar_chart(probs_df.set_index('Crop'))
+            # Load Weights
+            if name in saved_models:
+                model.load_state_dict(saved_models[name])
+                model.eval()
+                
+                with torch.no_grad():
+                    logits = model(input_tensor)
+                    probs = F.softmax(logits, dim=1)
+                    confidence, predicted_idx = torch.max(probs, 1)
+                    
+                    pred_class = label_encoder.inverse_transform([predicted_idx.item()])[0]
+                    conf_score = confidence.item() * 100
+                    
+                    # Formatting accuracy
+                    acc_val = test_accuracies.get(name, 0.0)
+                    if isinstance(acc_val, float):
+                        acc_str = f"{acc_val*100:.2f}%"
+                    else:
+                        acc_str = str(acc_val)
 
-with col2:
-    if st.session_state.get('button_clicked') or True: # Show by default or on click
-        st.subheader("🤖 Multi-Model Consensus")
+                    results.append({
+                        "Algorithm": name,
+                        "Predicted Crop": pred_class,
+                        "Confidence": f"{conf_score:.2f}%",
+                        "Test Set Accuracy": acc_str,
+                        "_raw_conf": conf_score
+                    })
+                    
+                    # Track best model based on confidence
+                    if conf_score > best_confidence:
+                        best_confidence = conf_score
+                        best_probs = probs[0]
+            else:
+                 results.append({
+                    "Algorithm": name,
+                    "Predicted Crop": "Error (Weights Missing)",
+                    "Confidence": "0%",
+                    "Test Set Accuracy": "N/A",
+                    "_raw_conf": 0
+                })
+            
+            progress_bar.progress((idx + 1) / len(model_names))
+            
+        progress_bar.empty()
         
-        comparison_df = get_all_model_predictions(system_data, input_data)
+        # 3. Display Results
+        st.divider()
         
-        # Formatting for display
-        comparison_df['Test Accuracy'] = comparison_df['Test Accuracy'].apply(lambda x: f"{x:.2%}")
+        # Create DataFrame
+        res_df = pd.DataFrame(results)
+        res_df = res_df.sort_values(by="_raw_conf", ascending=False).drop(columns=["_raw_conf"])
         
-        # Highlight best model row
-        best_name = system_data['best_name']
-        def highlight_best(row):
-            return ['background-color: #d4edda; color: #155724; font-weight: bold'] * len(row) if row['Algorithm'] == best_name else [''] * len(row)
+        # Highlight Top Result
+        top_row = res_df.iloc[0]
+        st.subheader(f"🏆 Top Prediction: {top_row['Predicted Crop']}")
+        st.success(f"**Recommended Crop: {top_row['Predicted Crop']}** (Confidence: {top_row['Confidence']} using {top_row['Algorithm']})")
+        
+        # Show Comparison Table
+        st.write("### 📊 Model Comparison")
+        
+        def highlight_best_row(row):
+            is_best = row['Algorithm'] == top_row['Algorithm']
+            # Green background with White text and Bold font for visibility
+            return ['background-color: #2E7D32; color: white; font-weight: bold' if is_best else '' for _ in row]
 
-        st.dataframe(
-            comparison_df.style.apply(highlight_best, axis=1), 
-            use_container_width=True,
-            hide_index=True
-        )
+        st.dataframe(res_df.style.apply(highlight_best_row, axis=1), use_container_width=True)
         
-        st.info("The table above shows what every trained algorithm predicts for your input, along with their historical test accuracy.")
+        # 4. Top 3 Alternatives
+        st.divider()
+        st.subheader(f"🥇 Top 3 Alternatives ({top_row['Algorithm']})")
+        
+        if best_probs is not None:
+            top3_prob, top3_idx = torch.topk(best_probs, 3)
+            
+            cols = st.columns(3)
+            for i in range(3):
+                crop_name = label_encoder.inverse_transform([top3_idx[i].item()])[0]
+                prob_val = top3_prob[i].item() * 100
+                
+                with cols[i]:
+                    st.metric(label=f"Rank #{i+1}", value=crop_name, delta=f"{prob_val:.1f}% Probability")
+                    st.progress(prob_val / 100)
+                    
+    except Exception as e:
+        st.error(f"An error occurred during prediction: {e}")
